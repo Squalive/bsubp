@@ -35,12 +35,6 @@ Assets/Unlicensed/...
 Assets/Unlicensed.meta
 ```
 
-`src/pack.rs` derives those keys from the parent *and grandparent* of the
-backup root, which is what keeps the leading `Assets/` component, and resolves
-the paths before stripping so relative and absolute inputs behave identically.
-Both properties are covered by tests (`collected_paths_keep_the_assets_prefix`
-and `relative_inputs_keep_the_metadata_beside_the_asset_root`).
-
 ## Restore cache
 
 Downloaded parts are cached under `target/bsubp-cache/<snapshot_id>/`. An
