@@ -1,12 +1,22 @@
-use crate::{BUCKET_NAME, make_bar};
-use aws_sdk_s3::{Client, primitives::ByteStream};
-use std::path::Path;
-use tokio::task::JoinSet;
-use walkdir::WalkDir;
+use crate::{
+    BUCKET_NAME, Progress,
+    pack::{
+        self, FileRecord, Manifest, collect_sources, manifest_key, plan_parts, upload_manifest,
+        upload_part,
+    },
+};
+use aws_sdk_s3::Client;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-pub async fn run(client: &Client) -> anyhow::Result<()> {
+/// Assets live under `Assets/Unlicensed/`; the snapshot is rooted at `Assets/`
+/// so file paths and object keys match the original layout.
+const UNLICENSED_ROOT: &str = "Assets/Unlicensed";
+const UNLICENSED_META: &str = "Assets/Unlicensed.meta";
+
+pub async fn run(client: &Client, progress: &Progress) -> anyhow::Result<()> {
     if !inquire::Confirm::new(
-        "Upload new Assets/Unlicensed/ and Assets/Unlicensed.meta snapshot to cloudflare storage",
+        "Upload a packed snapshot of Assets/Unlicensed/ and Assets/Unlicensed.meta?",
     )
     .with_default(false)
     .with_help_message("This will use your network to upload to cloudflare storage")
@@ -15,85 +25,98 @@ pub async fn run(client: &Client) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let unlicensed_root_path = Path::new("Assets/Unlicensed/");
-
     let snapshot_id = new_snapshot_id();
 
-    upload_unlicensed_dir_recursive(client, &snapshot_id, unlicensed_root_path).await?;
-    upload_file(client, &snapshot_id, Path::new("Assets/Unlicensed.meta")).await?;
+    let root = Path::new(UNLICENSED_ROOT);
+    if !root.is_dir() {
+        anyhow::bail!("{UNLICENSED_ROOT} not found; run from the game project root");
+    }
 
-    tracing::info!("New unlicensed private snapshot is backed up");
-    Ok(())
-}
+    let extra = [PathBuf::from(UNLICENSED_META)];
+    let files = Arc::new(collect_sources(root, &extra)?);
+    if files.is_empty() {
+        anyhow::bail!("nothing to back up under {UNLICENSED_ROOT}");
+    }
 
-async fn upload_file(client: &Client, snapshot_id: &str, file_path: &Path) -> anyhow::Result<()> {
-    let body = ByteStream::from_path(&file_path).await?;
-    client
-        .put_object()
-        .bucket(BUCKET_NAME)
-        .key(format!("{snapshot_id}/{}", file_path.display()))
-        .body(body)
-        .send()
-        .await?;
-    Ok(())
-}
+    let plan = plan_parts(&files);
+    let total_raw: u64 = files.iter().map(|f| f.size).sum();
 
-async fn upload_unlicensed_dir_recursive(
-    client: &Client,
-    snapshot_id: &str,
-    path: &Path,
-) -> anyhow::Result<()> {
-    const MAX_PARALLEL: usize = 10;
+    tracing::info!(
+        files = files.len(),
+        parts = plan.len(),
+        raw_bytes = total_raw,
+        "packing snapshot"
+    );
 
-    let mut entries = Vec::new();
-    for entry in WalkDir::new(path) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue; // skip directories and symlinks
+    // One part is built and uploaded at a time, so peak memory stays around a
+    // single part rather than the whole snapshot.
+    let bar = progress.bar_items(plan.len() as u64, "packing and uploading parts");
+    let mut records: Vec<FileRecord> = Vec::with_capacity(files.len());
+    let mut part_sizes: Vec<u64> = Vec::with_capacity(plan.len());
+    let mut uploaded_bytes = 0u64;
+
+    for (part, members) in plan.iter().enumerate() {
+        // Packing is synchronous CPU + file I/O, so keep it off the runtime.
+        // The file list is shared behind an Arc so the blocking closure can own
+        // its handle without copying the list per part.
+        let member_count = members.len();
+        let files_for_part = Arc::clone(&files);
+        let members_for_part = members.clone();
+        let (compressed, raw_len, offsets) = tokio::task::spawn_blocking(move || {
+            pack::build_part(&files_for_part, &members_for_part)
+        })
+        .await??;
+
+        // `build_part` reports offsets in tar order, which is the member order.
+        for (idx, offset) in offsets {
+            let file = &files[idx];
+            records.push(FileRecord {
+                path: file.rel_path.clone(),
+                part,
+                size: file.size,
+                offset,
+                unix_mode: file.unix_mode,
+                mtime: file.mtime,
+            });
         }
 
-        entries.push(entry.path().to_path_buf());
+        uploaded_bytes += compressed.len() as u64;
+        part_sizes.push(raw_len);
+
+        bar.set_message(format!("part {part:04} ({member_count} files)"));
+        upload_part(client, BUCKET_NAME, &snapshot_id, part, compressed).await?;
+        bar.inc(1);
     }
 
-    let bar = make_bar(entries.len() as u64);
+    bar.finish_with_message("parts uploaded");
 
-    let mut joinset = JoinSet::new();
+    let manifest = Manifest {
+        version: pack::MANIFEST_VERSION,
+        snapshot: snapshot_id.clone(),
+        parts: part_sizes,
+        files: records,
+    };
+    upload_manifest(client, BUCKET_NAME, &manifest).await?;
 
-    for local_path in entries {
-        let remote_key = format!("{snapshot_id}/{}", local_path.display());
-
-        let client = client.clone();
-        let bar = bar.clone();
-
-        joinset.spawn(async move {
-            let body = ByteStream::from_path(&local_path).await?;
-            client
-                .put_object()
-                .bucket(BUCKET_NAME)
-                .key(&remote_key)
-                .body(body)
-                .send()
-                .await?;
-
-            // Update inside the task so it reflects real completion
-            bar.set_message(remote_key.clone());
-            bar.inc(1);
-            Ok::<_, anyhow::Error>(())
-        });
-
-        // Throttle concurrency
-        while joinset.len() >= MAX_PARALLEL {
-            joinset.join_next().await;
-        }
-    }
-
-    while let Some(res) = joinset.join_next().await {
-        res??;
-    }
-    bar.finish_with_message("dir upload complete");
+    tracing::info!(
+        snapshot = %snapshot_id,
+        files = manifest.files.len(),
+        parts = manifest.parts.len(),
+        uploaded_bytes,
+        ratio = format!("{:.2}x", ratio(total_raw, uploaded_bytes)),
+        manifest = %manifest_key(&snapshot_id),
+        "snapshot uploaded"
+    );
     Ok(())
 }
 
-fn new_snapshot_id() -> String {
+fn ratio(raw: u64, compressed: u64) -> f64 {
+    if compressed == 0 {
+        return 0.0;
+    }
+    raw as f64 / compressed as f64
+}
+
+pub fn new_snapshot_id() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string()
 }
