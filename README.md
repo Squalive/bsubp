@@ -46,29 +46,3 @@ and `relative_inputs_keep_the_metadata_beside_the_asset_root`).
 Downloaded parts are cached under `target/bsubp-cache/<snapshot_id>/`. An
 interrupted restore resumes without re-fetching completed parts. Delete the
 directory to free the space or to force a clean download.
-
-## Progress output in CI
-
-`indicatif` hides progress bars entirely when stderr is not a terminal, which
-is exactly what happens under CI log capture (and under `| tee`), so nothing
-would appear in the job log. `src/main.rs` therefore picks a mode once at
-startup:
-
-- **Terminal**: the usual in-place repaint.
-- **Non-terminal**: a `TermLike` target that writes plain, newline-terminated
-  lines, throttled to one update every 200 ms so the log stays readable.
-
-Two details there are load-bearing and are covered by tests:
-
-- `indicatif` ends each repaint with `flush`, not `write_line`, on this kind of
-  target. Emitting from anywhere else silently produces no output at all.
-- The reported width must be comfortably wider than the rendered template.
-  `indicatif` pads each line to that width and subtracts, so a width that is
-  too small panics inside its draw — and the panic is swallowed, again leaving
-  no output.
-
-To see the log lines locally, run with stderr redirected:
-
-```sh
-bsubp restore latest -c 2>&1 | tee restore.log
-```
